@@ -1,0 +1,137 @@
+name: Node.js CI/CD Workflow
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        required: true
+        type: string
+        default: 'lts/*'
+      build_command:
+        required: false
+        type: string
+        default: 'npm run build'
+      test_command:
+        required: false
+        type: string
+        default: 'npm test'
+      s3_bucket:
+        required: true # I kept the bucket as an input for flexibility, but it can be fixed if you prefer
+        type: string
+      aws_region:
+        required: true
+        type: string
+      newman_collection_path:
+        required: true
+        type: string
+      newman_environment_path:
+        required: false
+        type: string
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+outputs:
+  artifact_url:
+    description: 'URL of the uploaded artifact in S3'
+    value: ${{ jobs.deploy.outputs.artifact_url }}
+
+jobs:
+  build_test_artifact:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_path: ${{ steps.generate_artifact.outputs.artifact_path }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Necessary to get the full history for the changelog
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Install dependencies
+        run: npm install
+      - name: Build
+        if: ${{ inputs.build_command != '' }}
+        run: ${{ inputs.build_command }}
+      - name: Test
+        run: ${{ inputs.test_command }}
+      - name: Generate Artifact
+        id: generate_artifact
+        run: |
+          mkdir dist
+          # Your artifact generation logic here
+          # Example: npm run build
+          cp -r build/* dist/
+          echo "::set-output name=artifact_path::dist"
+        shell: bash
+
+  deploy:
+    needs: build_test_artifact
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_url: ${{ steps.upload_s3.outputs.artifact_url }}
+    steps:
+      - name: Upload Artifact to S3
+        id: upload_s3
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+      - name: Upload to S3
+        run: |
+          ARTIFACT_NAME="my-app-${{ github.sha }}.zip" # Fixed artifact name
+          aws s3 cp --recursive ${{ needs.build_test_artifact.outputs.artifact_path }} s3://${{ inputs.s3_bucket }}/${{ github.repository }}/${{ github.run_id }}/${ARTIFACT_NAME}
+          echo "::set-output name=artifact_url::s3://${{ inputs.s3_bucket }}/${{ github.repository }}/${{ github.run_id }}/${ARTIFACT_NAME}"
+        shell: bash
+
+  integration_tests:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4 # May be needed if your Newman collection/environment are in the repo
+      - name: Run Integration Tests with Newman
+        uses: postmanlabs/newman-action@v2
+        with:
+          collection: ${{ inputs.newman_collection_path }}
+          environment: ${{ inputs.newman_environment_path }}
+
+  changelog:
+    needs: integration_tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # Get information about the last change
+      - name: Generate Changelog
+        id: changelog_generator
+        run: |
+          #!/bin/bash
+          # Example script to generate the changelog (needs to be adapted to your needs)
+
+          LAST_COMMIT=$(git log -1 --pretty=%H)
+          PREVIOUS_COMMIT=$(git log -2 --pretty=%H | head -n 1)
+
+          echo "## Changelog"
+          echo ""
+          echo "### Changes since the last release:"
+          git diff --name-only $PREVIOUS_COMMIT $LAST_COMMIT | while read -r file; do
+            echo "- Modified file: $file"
+          done
+          echo ""
+          echo "### Commits in this Pull Request (if applicable):"
+          if [ -n "${{ github.event.pull_request.number }}" ]; then
+            gh pr view ${{ github.event.pull_request.number }} --log --json commits | jq -r '.commits[].commit.message' | while read -r commit_message; do
+              echo "- $commit_message"
+            done
+          else
+            echo "Not a Pull Request."
+          fi
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # Necessary to use the gh cli
+        shell: bash
